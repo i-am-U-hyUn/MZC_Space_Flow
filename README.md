@@ -5,6 +5,7 @@
 
 - 📸 [스크린샷]
 [요건 정의 및 서비스 기획안 시나리오 보기 (GitHub 뷰어) ↗](docs/Requirements_And_Service_Plan_Team37_S3.pdf)
+
 [요건 정의 및 서비스 기획안 시나리오_Team 37_S3.pdf](https://github.com/user-attachments/files/27578045/_Team.37_S3.pdf)
 - 👥 Team 37 / MegazoneCloud
 
