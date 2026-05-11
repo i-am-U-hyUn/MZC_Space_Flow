@@ -1,0 +1,16 @@
+@import './styles/mzc-theme.css';
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  font-family: var(--mzc-font-sans);
+  color: var(--mzc-text);
+  background: var(--mzc-bg);
+}
+
+/* Agent status dot pulse (used by AgentStatusBadge) */
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.92); }
+}

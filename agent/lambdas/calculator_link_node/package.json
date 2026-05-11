@@ -1,0 +1,10 @@
+{
+  "name": "doc-agent-calculator-link-node",
+  "version": "1.0.0",
+  "description": "AWS Pricing Calculator saveAs API wrapper (ported from aws-calculator-mcp). Pure HTTP Lambda handler, no deps.",
+  "type": "module",
+  "main": "index.mjs",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20.0.0" }
+}

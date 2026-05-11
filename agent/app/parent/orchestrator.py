@@ -1,0 +1,2328 @@
+"""Parent Orchestrator — document state machine & router.
+
+Receives user messages, queries Document_State, builds a task plan,
+delegates to child agents/tools, and publishes patches via AppSync Events.
+
+State transitions: IDLE → PLANNING → DELEGATING → PATCHING → RESPONDING → IDLE
+
+Integrates with:
+- AgentCore Memory (long-term context retrieval + session event storage)
+- DynamoDB (Document_State fetch + optimistic lock updates)
+- AppSync Events (patch / status / chat publishing)
+- Sub-agents (task delegation via hub-and-spoke pattern)
+
+Requirements: 1.1, 1.2, 4.1, 4.2, 4.5, 4.6, 9.1, 9.4
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Optional
+
+import boto3
+
+from agent.lib.schema.document_state import (
+    DocumentState, DocumentMode, FieldStatus, FieldValue,
+)
+from agent.lib.schema.patch import AgentStatus, Patch, PatchOperation
+from agent.lib.storage.dynamodb import DocumentStore, VersionConflictError, DocumentNotFoundError
+from agent.lib.calculation.recalculate import recalculate_costs
+from agent.app.parent.inference_fallback import (
+    InferenceProfileFallback,
+    InferenceProfileUnavailableError,
+    FallbackResult,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# AppSync Events configuration
+# ---------------------------------------------------------------------------
+
+APPSYNC_HTTP_ENDPOINT: str = os.environ.get("APPSYNC_HTTP_ENDPOINT", "")
+APPSYNC_API_KEY: str = os.environ.get("APPSYNC_API_KEY", "")
+AWS_REGION: str = os.environ.get("AWS_REGION", "ap-northeast-2")
+
+
+# ---------------------------------------------------------------------------
+# State machine
+# ---------------------------------------------------------------------------
+
+class OrchestratorState(str, Enum):
+    IDLE = "idle"
+    PLANNING = "planning"
+    DELEGATING = "delegating"
+    PATCHING = "patching"
+    RESPONDING = "responding"
+
+
+# ---------------------------------------------------------------------------
+# Data classes for task planning and agent results
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Task:
+    agent: str = ""
+    action: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentResult:
+    success: bool = True
+    patches: list[dict] = field(default_factory=list)
+    chat_response: str = ""
+    error: Optional[str] = None
+    status: str = "completed"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaskPlan:
+    tasks: list[Task] = field(default_factory=list)
+    patch_proposals: list[Patch] = field(default_factory=list)
+    chat_response: str = ""
+    status_updates: list[AgentStatus] = field(default_factory=list)
+    new_version: int = 0
+    execution_log: list[dict] = field(default_factory=list)
+    status: str = "completed"
+    changed_sections: list[str] = field(default_factory=list)
+    created_change_request_ids: list[str] = field(default_factory=list)
+    tool_results: dict[str, Any] = field(default_factory=dict)
+    degraded_messages: list[str] = field(default_factory=list)
+
+
+
+class ParentOrchestrator:
+    """Top-level orchestrator for the document generation system.
+
+    Coordinates Memory retrieval, DynamoDB state management,
+    task planning, sub-agent delegation, and AppSync Events publishing.
+    """
+
+    def __init__(
+        self,
+        document_store: DocumentStore | None = None,
+        memory: Any | None = None,
+        gateway_client: Any | None = None,
+    ) -> None:
+        self.state = OrchestratorState.IDLE
+        self.document_store = document_store or DocumentStore()
+        self.memory = memory  # AgentCoreMemory instance (task 3.x)
+        self.gateway_client = gateway_client  # AgentCoreGatewayClient (optional)
+        self._memory_degraded = False  # tracks whether Memory is in degraded mode
+
+        # Wire up degraded callback if memory supports it (Req 2.5)
+        if self.memory is not None and hasattr(self.memory, "on_degraded"):
+            self.memory.on_degraded = self._on_memory_degraded
+
+        # Inference profile fallback helpers (Req 1.7)
+        from agent.app.parent.runtime import (
+            PARENT_MODEL,
+            PARENT_MODEL_FALLBACK,
+            CHILD_MODEL,
+            CHILD_MODEL_FALLBACK,
+        )
+        self.parent_fallback = InferenceProfileFallback(
+            primary=PARENT_MODEL,
+            fallback=PARENT_MODEL_FALLBACK,
+            role="parent",
+        )
+        self.child_fallback = InferenceProfileFallback(
+            primary=CHILD_MODEL,
+            fallback=CHILD_MODEL_FALLBACK,
+            role="child",
+        )
+
+        # Lazy sub-agent instances (Req 4.4 — logical agents within Parent)
+        self._discovery_agent: Any | None = None
+        self._architecture_agent: Any | None = None
+        self._staffing_agent: Any | None = None
+        self._cost_agent: Any | None = None
+        self._reviewer_agent: Any | None = None
+        self._formatter_agent: Any | None = None
+
+        # Logs for observability and auditing
+        self._patch_log: list[Patch] = []
+        self._status_log: list[dict] = []
+        self._audit_log: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Lazy sub-agent accessors (Req 4.4)
+    # ------------------------------------------------------------------
+
+    @property
+    def discovery_agent(self):
+        if self._discovery_agent is None:
+            from agent.app.discovery.discovery_agent import DiscoveryAgent
+            self._discovery_agent = DiscoveryAgent()
+        return self._discovery_agent
+
+    @property
+    def architecture_agent(self):
+        if self._architecture_agent is None:
+            from agent.app.architecture.architecture_agent import ArchitectureAgent
+            self._architecture_agent = ArchitectureAgent()
+        return self._architecture_agent
+
+    @property
+    def staffing_agent(self):
+        if self._staffing_agent is None:
+            from agent.app.staffing.staffing_agent import StaffingAgent
+            self._staffing_agent = StaffingAgent()
+        return self._staffing_agent
+
+    @property
+    def cost_agent(self):
+        if self._cost_agent is None:
+            from agent.app.cost.cost_agent import CostAgent
+            self._cost_agent = CostAgent()
+        return self._cost_agent
+
+    @property
+    def reviewer_agent(self):
+        if self._reviewer_agent is None:
+            from agent.app.reviewer.reviewer_agent import ReviewerAgent
+            self._reviewer_agent = ReviewerAgent()
+        return self._reviewer_agent
+
+    @property
+    def formatter_agent(self):
+        if self._formatter_agent is None:
+            from agent.app.formatter.formatter_agent import FormatterAgent
+            self._formatter_agent = FormatterAgent()
+        return self._formatter_agent
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    async def handle_message(
+        self,
+        doc_id: str,
+        user_message: str,
+        history: list[dict],
+        user_id: str = "",
+    ) -> TaskPlan:
+        """Process user message through the full orchestration pipeline.
+
+        Steps:
+            1. PLANNING  — Memory context retrieval + DynamoDB state fetch + task plan
+            2. DELEGATING — Sub-agent delegation
+            3. PATCHING  — Patch generation + DynamoDB optimistic lock update
+            4. RESPONDING — AppSync publish + Memory session event storage
+
+        Returns a TaskPlan with chat_response and new_version for the caller.
+        """
+        from agent.app.parent.task_planner import build_task_plan
+        from agent.lib.progress import (
+            ProgressPublisher,
+            set_current_publisher,
+            reset_current_publisher,
+        )
+
+        # Set the ProgressPublisher for this request so sub-agent Strands
+        # callbacks/hooks can discover it without having to thread it through.
+        publisher = ProgressPublisher(
+            doc_id=doc_id,
+            table=getattr(self.document_store, "_table", None),
+        )
+        publisher_token = set_current_publisher(publisher)
+
+        plan = TaskPlan()
+
+        try:
+            # --- IDLE → PLANNING ---
+            self._transition(OrchestratorState.PLANNING)
+            await self.publish_status(doc_id, AgentStatus.processing)
+
+            # Reset memory degraded flag for this request
+            self._memory_degraded = False
+
+            # Step 1: Retrieve long-term context from AgentCore Memory
+            memory_context = await self._retrieve_memory_context(doc_id, user_message)
+
+            # Supplement bounded history with long-term context (Req 2.3, 11.3)
+            if memory_context:
+                history = self._supplement_history_with_memory(history, memory_context)
+
+            # Step 2: Fetch Document_State + version from DynamoDB
+            doc_state, current_version = await self._fetch_document_state(doc_id)
+            raw_document = self._fetch_raw_document(doc_id, doc_state)
+
+            # Step 3: Build task plan (intent classification)
+            planner_plan = build_task_plan(user_message)
+            plan = TaskPlan(
+                tasks=[
+                    Task(agent=t.agent, action=t.action, params=dict(t.params))
+                    for t in planner_plan.tasks
+                ],
+                chat_response=planner_plan.chat_response,
+            )
+            logger.info("Task plan: %d tasks — %s", len(plan.tasks), [(t.agent, t.action) for t in plan.tasks])
+
+            # --- PLANNING → DELEGATING ---
+            self._transition(OrchestratorState.DELEGATING)
+
+            # Step 4: Delegate tasks to sub-agents and collect results
+            # All routing is handled by LLM-based task_planner — no keyword overrides
+            all_patches: list[Patch] = []
+            chat_parts: list[str] = [plan.chat_response] if plan.chat_response else []
+            overall_status = "completed"
+
+            for task in plan.tasks:
+                logger.info("Executing task: agent=%s action=%s", task.agent, task.action)
+                result = await self.delegate_task(task.agent, task, doc_state)
+                if result.chat_response:
+                    chat_parts.append(result.chat_response)
+                if result.metadata:
+                    key = result.metadata.get("tool") or task.action or task.agent
+                    plan.tool_results[key] = result.metadata
+                    if result.metadata.get("degraded_message"):
+                        plan.degraded_messages.append(str(result.metadata["degraded_message"]))
+                if result.status != "completed" or not result.success:
+                    overall_status = "partial_completed" if result.success else "failed"
+                if result.patches:
+                    from agent.app.parent.patch_builder import build_patch
+                    patch = build_patch(
+                        doc_id=doc_id,
+                        agent=task.agent,
+                        version=current_version,
+                        operations=result.patches,
+                    )
+                    all_patches.append(patch)
+
+            # Milestone sync trigger (Task 10.1 — Req 14.1)
+            # After staffing/scope changes, rebuild milestones
+            if self._detect_staffing_or_scope_change(plan.tasks):
+                ms_result = await self._trigger_milestone_sync(doc_id, doc_state)
+                if ms_result.chat_response:
+                    chat_parts.append(ms_result.chat_response)
+                if ms_result.patches:
+                    from agent.app.parent.patch_builder import build_patch
+                    ms_patch = build_patch(
+                        doc_id=doc_id,
+                        agent="milestone_sync",
+                        version=current_version,
+                        operations=ms_result.patches,
+                    )
+                    all_patches.append(ms_patch)
+
+            # --- DELEGATING → PATCHING ---
+            self._transition(OrchestratorState.PATCHING)
+
+            # Step 5: Apply patches with optimistic lock
+            new_version = current_version
+            if all_patches:
+                permission = self._resolve_permission(raw_document, user_id)
+                if self._can_apply_direct(raw_document, permission):
+                    new_version = await self.apply_patches(
+                        doc_id, all_patches, current_version
+                    )
+                    plan.changed_sections = _changed_sections(all_patches)
+                elif self._can_create_change_request(permission):
+                    change_request = self._create_change_request_record(
+                        doc_id=doc_id,
+                        requester=user_id or "runtime-placeholder",
+                        patches=all_patches,
+                    )
+                    saved = self._save_runtime_change_request(raw_document, current_version, change_request)
+                    new_version = int(saved.get("version", current_version))
+                    plan.created_change_request_ids.append(change_request["change_request_id"])
+                    overall_status = "partial_completed"
+                    chat_parts.append(
+                        "직접 반영 권한 또는 리뷰 정책 때문에 변경 요청으로 저장했습니다: "
+                        f"{change_request['change_request_id']}"
+                    )
+                else:
+                    overall_status = "failed"
+                    chat_parts.append(
+                        "현재 사용자 권한으로는 문서를 수정하거나 변경 요청을 생성할 수 없습니다."
+                    )
+
+            plan.patch_proposals = all_patches
+            plan.new_version = new_version
+            plan.chat_response = "\n\n".join(chat_parts) if chat_parts else plan.chat_response
+            plan.status = overall_status
+
+            # --- PATCHING → RESPONDING ---
+            self._transition(OrchestratorState.RESPONDING)
+
+            # Step 6: Store session events in AgentCore Memory
+            await self._store_session_event(doc_id, user_message, plan.chat_response)
+
+            # Step 7: Detect and store long-term facts (Req 2.2)
+            await self._detect_and_store_long_term_facts(doc_id, user_message, doc_state)
+
+            await self.publish_status(doc_id, AgentStatus.idle)
+
+            # Include execution log in plan for handler.py
+            plan.execution_log = {
+                "planned": [{"agent": t.agent, "action": t.action} for t in plan.tasks],
+                "executed": self._audit_log.copy(),
+            }
+
+        except VersionConflictError as exc:
+            logger.warning("Version conflict for doc_id=%s: %s", doc_id, exc)
+            await self.publish_status(doc_id, AgentStatus.error)
+            plan.chat_response = (
+                "문서 버전 충돌이 발생했습니다. 페이지를 새로고침한 후 다시 시도해주세요."
+            )
+            plan.status = "failed"
+        except InferenceProfileUnavailableError as exc:
+            logger.warning("Inference profile unavailable for doc_id=%s: %s", doc_id, exc)
+            await self._publish_degraded_status(doc_id, exc)
+            plan.chat_response = (
+                "현재 AI 모델 inference profile이 일시적으로 사용 불가합니다. "
+                "잠시 후 다시 시도해주세요."
+            )
+            plan.status = "failed"
+        except Exception as exc:
+            logger.exception("handle_message failed for doc_id=%s", doc_id)
+            await self.publish_status(doc_id, AgentStatus.error)
+            plan.chat_response = f"처리 중 오류가 발생했습니다: {exc}"
+            plan.status = "failed"
+        finally:
+            # --- → IDLE ---
+            self._transition(OrchestratorState.IDLE)
+            # Flush any pending token/reasoning deltas and detach publisher.
+            try:
+                publisher.flush()
+            except Exception:
+                pass
+            reset_current_publisher(publisher_token)
+
+        return plan
+
+    # ------------------------------------------------------------------
+    # Sub-agent delegation
+    # ------------------------------------------------------------------
+
+    async def delegate_task(
+        self,
+        agent_name: str,
+        task: Task,
+        doc_state: DocumentState,
+    ) -> AgentResult:
+        """Delegate a task to a child agent (hub-and-spoke pattern).
+
+        All coordination goes through Parent; sub-agents never
+        communicate directly with each other.
+
+        Routes to the correct sub-agent based on agent_name:
+          - discovery_agent → DiscoveryAgent.collect_info()
+          - architecture_agent → ArchitectureAgent.analyze_existing() / design_new()
+          - staffing_agent → StaffingAgent.recommend()
+          - cost_agent → CostAgent.calculate_staffing_cost() / calculate_aws_cost()
+          - reviewer_agent → ReviewerAgent.review()
+          - formatter_agent → FormatterAgent.export_docx()
+
+        Maintains auditable mapping: user message → delegated task → patches.
+
+        Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6
+        """
+        result = AgentResult(success=True)
+
+        # Use the current request's ProgressPublisher if already set by
+        # handle_message; otherwise construct a transient one.
+        from agent.lib.progress import ProgressPublisher, get_current_publisher
+        progress = get_current_publisher() or ProgressPublisher(
+            doc_id=doc_state.document_id,
+            table=getattr(self.document_store, "_table", None),
+        )
+
+        agent_labels = {
+            "internal_tools": "🧩 내부 도구",
+            "discovery_agent": "📋 정보 수집",
+            "section_writer_agent": "✏️ 섹션 작성",
+            "staffing_agent": "👥 팀 구성 추천",
+            "cost_agent": "💰 비용 산정",
+            "architecture_agent": "🏗️ 아키텍처 분석",
+            "reviewer_agent": "🔎 문서 리뷰",
+            "formatter_agent": "📄 DOCX 생성",
+            "conversation_agent": "💬 대화 처리",
+        }
+        label = agent_labels.get(agent_name, agent_name)
+        progress.publish(agent_name, f"{label} 시작...", step="start")
+
+        try:
+            logger.info("delegate_task: agent=%s action=%s params=%s", agent_name, task.action, {k: v for k, v in task.params.items() if k != "message"})
+            if agent_name == "internal_tools":
+                result = await self._delegate_internal_tool(task, doc_state)
+            elif agent_name == "discovery_agent":
+                result = await self._delegate_discovery(task, doc_state)
+            elif agent_name == "conversation_agent":
+                result = self._delegate_conversation(task)
+            elif agent_name == "section_writer_agent":
+                result = await self._delegate_section_writer(task, doc_state)
+            elif agent_name == "architecture_agent":
+                result = await self._delegate_architecture(task, doc_state)
+            elif agent_name == "staffing_agent":
+                result = await self._delegate_staffing(task, doc_state)
+            elif agent_name == "cost_agent":
+                result = await self._delegate_cost(task, doc_state)
+            elif agent_name == "reviewer_agent":
+                result = await self._delegate_reviewer(task, doc_state)
+            elif agent_name == "formatter_agent":
+                result = await self._delegate_formatter(task, doc_state)
+            else:
+                result = AgentResult(
+                    success=False,
+                    chat_response=f"알 수 없는 에이전트: {agent_name}",
+                    error=f"Unknown agent: {agent_name}",
+                )
+        except Exception as exc:
+            logger.exception("delegate_task failed for agent=%s", agent_name)
+            result = AgentResult(
+                success=False,
+                chat_response=f"[{agent_name}] 작업 처리 중 오류가 발생했습니다: {exc}",
+                error=str(exc),
+            )
+
+        # Auditable mapping entry (Req 4.6)
+        self._audit_log.append({
+            "agent": agent_name,
+            "action": task.action,
+            "params": task.params,
+            "success": result.success,
+            "patches_count": len(result.patches),
+            "status": result.status,
+            "metadata_keys": sorted(result.metadata.keys()),
+        })
+
+        # Publish completion progress
+        if result.success:
+            summary = result.chat_response[:100] if result.chat_response else "완료"
+            progress.complete(agent_name, f"✅ {label} 완료 — {summary}")
+        else:
+            progress.publish(agent_name, f"⚠️ {label} 실패", step="error")
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-agent delegation helpers
+    # ------------------------------------------------------------------
+
+    async def _delegate_internal_tool(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Run Parent-owned MCP-style tools with local deterministic fallback."""
+        from agent.app.parent.internal_tools import (
+            calculate_resource_plan,
+            resource_plan_patches,
+            run_submission_lint,
+        )
+
+        action = task.action
+        params = task.params or {}
+        document = doc_state.model_dump(mode="json")
+
+        if action == "run_submission_lint":
+            result = run_submission_lint(document)
+            result["document_id"] = doc_state.document_id
+            issue_count = sum(len(v) for v in result.get("issues", {}).values())
+            chat = (
+                f"Submission readiness review 완료. Readiness score: "
+                f"{result.get('readiness_score', 0)}/100. "
+                f"{issue_count} issue(s) are recommended before submission."
+            )
+            if result.get("kb_retrieval", {}).get("mode") == "fallback":
+                chat += " Approved samples KB is not configured, so deterministic checks were used."
+            return AgentResult(
+                success=True,
+                chat_response=chat,
+                metadata={"tool": "run_submission_lint", "result": result},
+            )
+
+        if action == "calculate_resource_plan":
+            result = calculate_resource_plan(params)
+            chat = (
+                "Resource planning draft completed. "
+                f"Required ARR: ${result.get('required_arr', 0):,.2f}; "
+                f"eligible funding: ${result.get('eligible_funding_amount', 0):,.2f}. "
+                f"{result.get('warnings', [''])[0]}"
+            )
+            patches = resource_plan_patches(result) if params.get("apply") else []
+            return AgentResult(
+                success=True,
+                patches=patches,
+                chat_response=chat,
+                metadata={"tool": "calculate_resource_plan", "result": result},
+            )
+
+        if action == "aws_service_explanation":
+            services = [
+                _field_value_resolve(svc.get("service_name", {})) or svc.get("service_id", "")
+                for svc in document.get("sections", {}).get("architecture", {}).get("services", [])
+                if isinstance(svc, dict)
+            ]
+            service_text = ", ".join(str(s) for s in services if s) or "Amazon Bedrock, AWS Lambda, Amazon S3, Amazon OpenSearch Service"
+            return AgentResult(
+                success=True,
+                chat_response=(
+                    "AWS service explanation draft: "
+                    f"{service_text}. Use Amazon Bedrock for GenAI model capability, "
+                    "Lambda for workflow/API glue, S3 for source and output artifacts, "
+                    "and OpenSearch or Knowledge Bases for retrieval when needed."
+                ),
+                metadata={
+                    "tool": "aws_service_explanation",
+                    "services": services,
+                    "degraded_message": "Gateway not required; returned local service explanation draft.",
+                },
+            )
+
+        if action in ("create_change_request", "apply_document_patch", "fast_edit"):
+            return AgentResult(
+                success=True,
+                status="partial_completed",
+                chat_response=(
+                    "이 요청은 구조화된 JSON Patch가 있어야 안전하게 처리할 수 있습니다. "
+                    "현재 채팅 메시지에서는 변경 대상과 값을 확정하지 않았으므로 문서는 수정하지 않았습니다."
+                ),
+                metadata={
+                    "tool": action,
+                    "degraded_message": "Structured patch was not present in the runtime prompt.",
+                },
+            )
+
+        return AgentResult(
+            success=False,
+            status="failed",
+            chat_response=f"지원하지 않는 내부 도구 액션입니다: {action}",
+            error=f"Unsupported internal tool action: {action}",
+            metadata={"tool": action},
+        )
+
+    def _delegate_conversation(self, task: Task) -> AgentResult:
+        """Handle simple non-document chat without mutating Document_State."""
+        message = task.params.get("message", "").strip()
+        if message.isdigit():
+            response = (
+                "입력하신 내용만으로는 프로젝트 정보를 판단하기 어렵습니다. "
+                "예: '고객사는 visang이고 GenAI 문서 자동화 PoC를 진행합니다'처럼 알려주세요."
+            )
+        else:
+            response = (
+                "가능합니다. 다만 이 채팅은 APN PoC Project Plan 작성을 돕는 용도라, "
+                "문서에 반영할 내용이면 고객사, 목표, 범위, 일정, 팀 구성처럼 알려주시면 바로 반영하겠습니다."
+            )
+        return AgentResult(success=True, chat_response=response)
+
+    async def _delegate_discovery(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to DiscoveryAgent.collect_info().
+
+        Requirements: 6.1, 6.2, 6.3, 6.4
+        """
+        user_input = task.params.get("message", "")
+        discovery_result = await self.discovery_agent.collect_info(user_input, doc_state)
+
+        patches: list[dict] = []
+        chat_parts: list[str] = []
+
+        # Track which fields we actually captured this turn (for user-facing ack)
+        captured: list[tuple[str, str]] = []
+
+        # Apply extracted fields as patches (v2: no /meta/project_goal, no /sections/scope_of_work/summary)
+        for field_name, value in discovery_result.structured_input.items():
+            if value is not None:
+                if field_name == "customer":
+                    patches.append({
+                        "op": "replace",
+                        "path": "/meta/customer/user_input",
+                        "value": value,
+                        "source": "user_input",
+                    })
+                    captured.append(("고객사", str(value)))
+                elif field_name == "partner":
+                    patches.append({
+                        "op": "replace",
+                        "path": "/meta/partner/user_input",
+                        "value": value,
+                        "source": "user_input",
+                    })
+                    captured.append(("파트너", str(value)))
+                elif field_name == "start_date":
+                    patches.append({
+                        "op": "replace",
+                        "path": "/meta/date/user_input",
+                        "value": value,
+                        "source": "user_input",
+                    })
+                    captured.append(("시작일", str(value)))
+                elif field_name == "project_goal":
+                    # v2: project_goal maps to executive_summary/customer_intro
+                    patches.append({
+                        "op": "replace",
+                        "path": "/sections/executive_summary/customer_intro",
+                        "value": _ai_field_value(value),
+                        "source": "user_input",
+                    })
+                    captured.append(("프로젝트 목표", str(value)))
+                elif field_name == "scope_summary":
+                    # v2: scope_summary maps to executive_summary/problem_statement
+                    patches.append({
+                        "op": "replace",
+                        "path": "/sections/executive_summary/problem_statement",
+                        "value": _ai_field_value(value),
+                        "source": "user_input",
+                    })
+                    captured.append(("프로젝트 범위", str(value)))
+
+        # Only patch /mode when the user explicitly indicated architecture availability.
+        # Previously this overwrote mode every turn, even when the user didn't mention
+        # architecture. Leave the doc_state default (architecture_absent) alone until
+        # we get explicit input.
+        arch_available = discovery_result.structured_input.get("architecture_available")
+        if arch_available is True:
+            patches.append({
+                "op": "replace",
+                "path": "/mode",
+                "value": DocumentMode.architecture_present.value,
+                "source": "ai_recommended",
+            })
+            captured.append(("아키텍처 자료", "있음"))
+        elif arch_available is False:
+            patches.append({
+                "op": "replace",
+                "path": "/mode",
+                "value": DocumentMode.architecture_absent.value,
+                "source": "ai_recommended",
+            })
+            captured.append(("아키텍처 자료", "없음"))
+
+        patches.extend(_discovery_schema_patches(discovery_result))
+
+        # Build chat response: acknowledge what was captured, then ask only what's
+        # still missing for draft generation. Do NOT dump all export-required
+        # questions at once — export is validated at export time.
+        if captured:
+            chat_parts.append("받은 정보:")
+            for label, value in captured:
+                truncated = value if len(value) <= 80 else f"{value[:77]}..."
+                chat_parts.append(f"  • {label}: {truncated}")
+
+        if discovery_result.can_generate_draft:
+            if chat_parts:
+                chat_parts.append("")
+            chat_parts.append("프로젝트 정보 수집이 완료되었습니다. 초안 생성을 진행합니다.")
+        elif discovery_result.follow_up_questions:
+            if chat_parts:
+                chat_parts.append("")
+            chat_parts.append("아직 필요한 정보:")
+            for q in discovery_result.follow_up_questions:
+                chat_parts.append(f"  • {q}")
+        elif not captured:
+            chat_parts.append("[discovery_agent] 정보 수집을 처리했습니다.")
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    async def _delegate_section_writer(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Generate or update a document section using Bedrock LLM.
+
+        The section_writer_agent handles requests like "Assumptions 작성해줘",
+        "Scope 작성해줘", etc. It uses the current document context to generate
+        appropriate section content.
+        """
+        import json as _json
+        section_name = task.params.get("section", "")
+        message = task.params.get("message", "")
+
+        if not section_name:
+            # Try to infer section from message
+            section_map = {
+                "overview": "executive_summary", "summary": "executive_summary",
+                "executive": "executive_summary", "요약": "executive_summary",
+                "scope": "scope_of_work", "범위": "scope_of_work",
+                "success": "success_criteria", "kpi": "success_criteria",
+                "성공": "success_criteria",
+                "assumptions": "assumptions", "가정": "assumptions",
+                "리스크": "assumptions", "risk": "assumptions",
+                "milestones": "milestones", "마일스톤": "milestones",
+                "일정": "milestones",
+                "acceptance": "acceptance", "인수": "acceptance",
+                "수락": "acceptance",
+            }
+            msg_lower = message.lower()
+            for keyword, sec in section_map.items():
+                if keyword in msg_lower:
+                    section_name = sec
+                    break
+
+        if not section_name:
+            return AgentResult(
+                success=False,
+                chat_response="어떤 섹션을 작성할지 지정해주세요. (예: Overview, Scope, Assumptions, Success Criteria, Milestones, Acceptance)",
+            )
+
+        logger.info("section_writer: generating section=%s", section_name)
+
+        # Build context from current document state
+        meta = doc_state.meta
+        context_parts = []
+        if meta.customer.user_input:
+            context_parts.append(f"고객사: {meta.customer.user_input}")
+        if meta.partner.user_input:
+            context_parts.append(f"파트너: {meta.partner.user_input}")
+        cover = doc_state.sections.cover
+        if hasattr(cover, 'model_extra') and cover.model_extra:
+            for k, v in cover.model_extra.items():
+                if v:
+                    context_parts.append(f"{k}: {v}")
+
+        doc_context = "\n".join(context_parts) if context_parts else "프로젝트 정보가 아직 부족합니다."
+
+        section_display_names = {
+            "executive_summary": "Executive Summary",
+            "scope_of_work": "Scope of Work",
+            "success_criteria": "Success Criteria / KPIs",
+            "assumptions": "Assumptions & Risks",
+            "milestones": "Milestones & Deliverables",
+            "acceptance": "Acceptance Criteria",
+        }
+        display_name = section_display_names.get(section_name, section_name)
+
+        system_prompt = f"""당신은 APN PoC Project Plan 문서의 '{display_name}' 섹션을 작성하는 전문가입니다.
+현재까지 수집된 프로젝트 정보를 바탕으로 해당 섹션의 내용을 한국어로 작성하세요.
+
+프로젝트 정보:
+{doc_context}
+
+규칙:
+- 반드시 한국어로 작성하세요
+- 정보가 부족하더라도 합리적인 초안을 작성하세요
+- 구체적이고 전문적인 내용으로 작성하세요
+- JSON 형식으로 응답하세요: {{"items": {{"key1": "내용1", "key2": "내용2", ...}}}}
+- key는 항목의 제목 (예: "가정사항_1", "리스크_1", "KPI_1" 등)
+- 3~5개 항목을 작성하세요"""
+
+        try:
+            fallback = self.child_fallback
+            model_id = fallback.primary or "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+            bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+            resp = bedrock.invoke_model(
+                modelId=model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=_json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 2000,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": message}],
+                }),
+            )
+            raw = _json.loads(resp["body"].read())["content"][0]["text"]
+            logger.info("section_writer raw response length=%d", len(raw))
+
+            # Parse JSON from response
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = _json.loads(raw[start:end])
+                items = parsed.get("items", parsed)
+            else:
+                items = {"content": raw}
+
+            # Build patches for the section
+            patches = []
+            for key, value in items.items():
+                patches.append({
+                    "op": "add",
+                    "path": f"/sections/{section_name}/{key}",
+                    "value": value,
+                })
+
+            chat_response = f"{display_name} 섹션을 작성했습니다.\n\n"
+            for key, value in items.items():
+                chat_response += f"**{key}**: {value}\n\n"
+
+            return AgentResult(
+                success=True,
+                patches=patches,
+                chat_response=chat_response,
+            )
+        except Exception as exc:
+            logger.exception("section_writer failed for section=%s", section_name)
+            return AgentResult(
+                success=False,
+                chat_response=f"{display_name} 섹션 작성 중 오류가 발생했습니다: {exc}",
+                error=str(exc),
+            )
+
+    async def _delegate_architecture(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to ArchitectureAgent.analyze_existing() or design_new().
+
+        Dual-entry mode:
+          - .drawio content → analyze_existing (architecture_present)
+          - text description → design_new (architecture_absent)
+
+        Requirements: 5.1, 5.2, 5.3
+        """
+        action = task.action
+        message = task.params.get("message", "")
+        patches: list[dict] = []
+
+        if action == "analyze_existing":
+            # architecture_present mode
+            arch_result = await self.architecture_agent.analyze_existing(
+                message, doc_state
+            )
+            patches.append({
+                "op": "replace",
+                "path": "/mode",
+                "value": DocumentMode.architecture_present.value,
+                "source": "ai_recommended",
+            })
+        else:
+            # architecture_absent → design_new
+            from agent.app.architecture.architecture_agent import ProjectContext
+            ctx = ProjectContext(
+                project_goal=message,
+                scope_summary=task.params.get("scope", ""),
+            )
+            arch_result = await self.architecture_agent.design_new(ctx, doc_state)
+
+        # Store architecture results as patches
+        if arch_result.services:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/services",
+                "value": [_architecture_service_to_field_values(s) for s in arch_result.services],
+                "source": "ai_recommended",
+            })
+        overview = getattr(arch_result, "overview", "")
+        if overview:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/overview",
+                "value": _ai_field_value(overview),
+                "source": "ai_recommended",
+            })
+        if arch_result.analysis:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/analysis",
+                "value": arch_result.analysis,
+                "source": "ai_recommended",
+            })
+        if arch_result.recommendations:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/recommendations",
+                "value": arch_result.recommendations,
+                "source": "ai_recommended",
+            })
+        # v2: architecture uses overview (not description) and tools_list (not tools)
+        architecture_description = getattr(arch_result, "description", "") or getattr(arch_result, "architecture_description", "")
+        if architecture_description:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/overview",
+                "value": _ai_field_value(architecture_description),
+                "source": "ai_recommended",
+            })
+        tools = getattr(arch_result, "tools", None)
+        if tools:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/architecture/tools_list",
+                "value": [_ai_field_value(tool) for tool in tools],
+                "source": "ai_recommended",
+            })
+
+        chat_response = arch_result.analysis or "[architecture_agent] 아키텍처 분석을 완료했습니다."
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response=chat_response,
+        )
+
+    async def _delegate_staffing(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to StaffingAgent.recommend().
+
+        Requirements: 7.1, 7.2, 7.4, 7.5, 7.6
+        """
+        message = task.params.get("message", "")
+        rec = self.staffing_agent.recommend(message)
+
+        # v2: staffing data goes to /sections/resources_cost_estimates/ (not /staffing_plan/)
+        patches: list[dict] = []
+        if rec.roles:
+            # Convert roles to partner_technical_team entries
+            team_members = []
+            for role_id, role_data in rec.roles.items():
+                display_name = role_data.get("display_name", role_id) if isinstance(role_data, dict) else role_id
+                team_members.append({
+                    "role": _ai_field_value(display_name),
+                    "name": _ai_field_value(""),
+                })
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/partner_technical_team",
+                "value": team_members,
+                "source": "ai_recommended",
+            })
+
+        chat_parts = [f"[staffing_agent] {rec.project_type} 유형 기반 팀 구성을 추천했습니다."]
+        if rec.violations:
+            chat_parts.append(f"⚠️ {len(rec.violations)}건의 단가 범위 위반이 감지되었습니다.")
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    async def _delegate_cost(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to CostAgent.calculate_staffing_cost() or calculate_aws_cost().
+
+        v2: staffing data is in resources_cost_estimates, cost fields are flat.
+
+        Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8
+        """
+        action = task.action
+        patches: list[dict] = []
+        chat_parts: list[str] = []
+
+        if action == "calculate_aws_cost" and self.gateway_client:
+            services = task.params.get("services", [])
+            aws_result = await self.cost_agent.calculate_aws_cost(
+                services, self.gateway_client
+            )
+            # v2: flat cost fields (calculator_url, mrr, arr, breakdown_table)
+            if hasattr(aws_result, "calculator_share_url") and aws_result.calculator_share_url:
+                patches.append({
+                    "op": "replace",
+                    "path": "/sections/cost_breakdown/calculator_url",
+                    "value": _ai_field_value(aws_result.calculator_share_url),
+                    "source": "calculated",
+                })
+            if hasattr(aws_result, "monthly_cost_summary"):
+                patches.append({
+                    "op": "replace",
+                    "path": "/sections/cost_breakdown/mrr",
+                    "value": _ai_field_value(str(aws_result.monthly_cost_summary)),
+                    "source": "calculated",
+                })
+            total_project_cost = _current_staffing_total(doc_state) + getattr(aws_result, "monthly_cost_summary", 0)
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/contribution",
+                "value": self.cost_agent.calculate_default_contribution(
+                    total_project_cost
+                ).model_dump(mode="json"),
+                "source": "calculated",
+            })
+            chat_parts.append(f"[cost_agent] AWS 서비스 비용: 월 ${getattr(aws_result, 'monthly_cost_summary', 0):,.2f}")
+        else:
+            # Default: calculate staffing cost using resources_cost_estimates
+            resources = doc_state.sections.resources_cost_estimates
+            staffing_result = self.cost_agent.calculate_staffing_cost(resources)
+            # v2: update total_cost in resources_cost_estimates
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/total_cost",
+                "value": {
+                    "sa": str(getattr(staffing_result, "sa_total", "")),
+                    "eng": str(getattr(staffing_result, "eng_total", "")),
+                    "other": str(getattr(staffing_result, "other_total", "")),
+                    "total": str(getattr(staffing_result, "grand_total", 0)),
+                },
+                "source": "calculated",
+            })
+            total_project_cost = getattr(staffing_result, "grand_total", 0) + _current_aws_monthly_total(doc_state)
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/contribution",
+                "value": self.cost_agent.calculate_default_contribution(
+                    total_project_cost
+                ).model_dump(mode="json"),
+                "source": "calculated",
+            })
+            chat_parts.append(
+                f"[cost_agent] 인건비 계산 완료: 총 ${getattr(staffing_result, 'grand_total', 0):,.2f}"
+            )
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    async def _delegate_reviewer(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to ReviewerAgent.review().
+
+        Requirements: 13.1, 13.2, 17.1
+        """
+        review_result = self.reviewer_agent.review(doc_state)
+
+        patches: list[dict] = [
+            {
+                "op": "replace",
+                "path": "/completion_score",
+                "value": review_result.completion_score,
+                "source": "calculated",
+            },
+            {
+                "op": "replace",
+                "path": "/blocking_issues",
+                "value": [i.model_dump() for i in review_result.blocking_issues],
+                "source": "calculated",
+            },
+            {
+                "op": "replace",
+                "path": "/warnings",
+                "value": [w.model_dump() for w in review_result.warnings],
+                "source": "calculated",
+            },
+        ]
+
+        chat_parts = [
+            f"[reviewer_agent] 문서 리뷰 완료 — 완성도: {review_result.completion_score:.0%}"
+        ]
+        if review_result.blocking_issues:
+            chat_parts.append(
+                f"🚫 Blocking issues: {len(review_result.blocking_issues)}건"
+            )
+        if review_result.warnings:
+            chat_parts.append(
+                f"⚠️ Warnings: {len(review_result.warnings)}건"
+            )
+        if review_result.suggestions:
+            for s in review_result.suggestions[:3]:
+                chat_parts.append(f"  • {s}")
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    async def _delegate_formatter(
+        self, task: Task, doc_state: DocumentState
+    ) -> AgentResult:
+        """Delegate to FormatterAgent.export_docx().
+
+        Requirements: 13.3, 13.4
+        """
+        if not self.gateway_client:
+            return AgentResult(
+                success=False,
+                chat_response="[formatter_agent] Gateway 클라이언트가 설정되지 않아 DOCX export를 수행할 수 없습니다.",
+                error="No gateway_client configured",
+            )
+
+        export_result = await self.formatter_agent.export_docx(
+            doc_state, self.gateway_client
+        )
+
+        if not export_result.success:
+            return AgentResult(
+                success=False,
+                chat_response=f"[formatter_agent] DOCX export 실패: {export_result.error}",
+                error=export_result.error,
+            )
+
+        patches: list[dict] = []
+        if export_result.s3_path:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/export_s3_path",
+                "value": export_result.s3_path,
+                "source": "calculated",
+            })
+
+        chat_response = "[formatter_agent] DOCX export 완료"
+        if export_result.download_url:
+            chat_response += f"\n📥 다운로드: {export_result.download_url}"
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response=chat_response,
+        )
+
+    # ------------------------------------------------------------------
+    # Milestone sync (Task 10.1 — Req 14.1, 14.2, 14.3)
+    # ------------------------------------------------------------------
+
+    async def _trigger_milestone_sync(
+        self,
+        doc_id: str,
+        doc_state: DocumentState,
+    ) -> AgentResult:
+        """Rebuild milestones when staffing or scope_of_work changes.
+
+        v2: staffing data is in resources_cost_estimates (not staffing_plan).
+
+        Requirements: 14.1, 14.2, 14.3
+        """
+        resources_dict = doc_state.sections.resources_cost_estimates.model_dump(mode="json")
+        scope_dict = doc_state.sections.scope_of_work.model_dump(mode="json")
+
+        params = {
+            "resources_cost_estimates": resources_dict,
+            "scope_of_work": scope_dict,
+        }
+
+        patches: list[dict] = []
+        chat_parts: list[str] = []
+
+        if self.gateway_client:
+            result, error = await self.gateway_client.call_tool_safe(
+                "build_milestone_summary", params
+            )
+            if error or result is None:
+                logger.warning("build_milestone_summary failed: %s", error)
+                chat_parts.append(
+                    "[milestone_sync] Gateway 호출 실패 — 로컬 동기화로 대체합니다."
+                )
+                # Fallback to local sync
+                result = self._local_milestone_sync(resources_dict, scope_dict)
+        else:
+            # No gateway client — use local sync
+            result = self._local_milestone_sync(resources_dict, scope_dict)
+
+        if result:
+            phases = result.get("phases", [])
+            phase_values = [_milestone_phase_to_field_values(p) for p in phases]
+            patches.append({
+                "op": "replace",
+                "path": "/sections/milestones/phases",
+                "value": phase_values,
+                "source": "calculated",
+            })
+            total_hours = result.get("total_project_hours", 0)
+            chat_parts.append(
+                f"[milestone_sync] 마일스톤 동기화 완료 — {len(phases)}개 phase, "
+                f"총 {total_hours}시간"
+            )
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts) if chat_parts else "",
+        )
+
+    @staticmethod
+    def _local_milestone_sync(
+        resources_cost_estimates: dict, scope_of_work: dict
+    ) -> dict:
+        """Local fallback milestone generation without Gateway call.
+        v2: reads from resources_cost_estimates (not staffing_plan).
+        """
+        phases_list = ("discovery", "development", "testing")
+        default_deliverables = {
+            "discovery": ["요구사항 문서", "아키텍처 설계서", "프로젝트 계획서"],
+            "development": ["에이전트 구현", "API 개발", "UI 구현", "통합"],
+            "testing": ["통합 테스트", "UAT", "버그 수정", "최종 문서"],
+        }
+        # v2: phase_hours_table is a list of PhaseHours dicts
+        phase_hours_table = resources_cost_estimates.get("phase_hours_table", [])
+        team = resources_cost_estimates.get("partner_technical_team", [])
+        phases: list[dict] = []
+        for phase_name in phases_list:
+            total_hours = 0.0
+            legacy_roles = resources_cost_estimates.get("roles", {})
+            if isinstance(legacy_roles, dict):
+                for role_data in legacy_roles.values():
+                    if not isinstance(role_data, dict):
+                        continue
+                    phase_data = (role_data.get("phase_hours") or {}).get(phase_name, {})
+                    total_hours += _field_value_number(phase_data)
+            # Find matching phase in phase_hours_table
+            for ph in phase_hours_table:
+                ph_phase = ph.get("phase", {})
+                ph_name = ph_phase.get("user_input") or ph_phase.get("ai_recommended") or ph_phase.get("calculated") or "" if isinstance(ph_phase, dict) else str(ph_phase)
+                if phase_name.lower() in str(ph_name).lower():
+                    total_hours = float(ph.get("total", 0))
+                    break
+            assigned = []
+            if isinstance(legacy_roles, dict):
+                for role_data in legacy_roles.values():
+                    if not isinstance(role_data, dict):
+                        continue
+                    display_name = role_data.get("display_name")
+                    if display_name and display_name not in assigned:
+                        assigned.append(display_name)
+            for member in team:
+                role_fv = member.get("role", {})
+                name = role_fv.get("user_input") or role_fv.get("ai_recommended") or role_fv.get("calculated") or "" if isinstance(role_fv, dict) else str(role_fv)
+                if name and name not in assigned:
+                    assigned.append(name)
+            deliverables = scope_of_work.get(
+                f"{phase_name}_deliverables",
+                default_deliverables.get(phase_name, []),
+            )
+            if not isinstance(deliverables, list):
+                deliverables = default_deliverables.get(phase_name, [])
+            phases.append({
+                "phase": phase_name,
+                "total_hours": round(total_hours, 2),
+                "roles": assigned,
+                "deliverables": deliverables,
+            })
+        return {
+            "phases": phases,
+            "total_project_hours": round(sum(p["total_hours"] for p in phases), 2),
+        }
+
+    # ------------------------------------------------------------------
+    # Review / Export flow (Task 10.2 — Req 13.1, 13.2, 13.3, 13.4)
+    # ------------------------------------------------------------------
+
+    async def _handle_review_request(
+        self,
+        doc_id: str,
+        doc_state: DocumentState,
+    ) -> AgentResult:
+        """Handle review request: Reviewer Agent + Gateway validation.
+
+        1. Delegate to ReviewerAgent for local review
+        2. Call Gateway ``validate_template_constraints`` for template validation
+        3. Merge blocking issues + warnings from both sources
+
+        Requirements: 13.1, 13.2
+        """
+        # Step 1: Local reviewer agent review
+        review_task = Task(agent="reviewer_agent", action="review", params={})
+        reviewer_result = await self.delegate_task("reviewer_agent", review_task, doc_state)
+
+        # Step 2: Gateway template validation
+        gateway_issues: list[dict] = []
+        gateway_warnings: list[dict] = []
+
+        if self.gateway_client:
+            params = {
+                "sections": doc_state.sections.model_dump(mode="json"),
+                "completion_score": doc_state.completion_score,
+            }
+            gw_result, error = await self.gateway_client.call_tool_safe(
+                "validate_template_constraints", params
+            )
+            if gw_result and not error:
+                gateway_issues = gw_result.get("blocking_issues", [])
+                gateway_warnings = gw_result.get("warnings", [])
+
+        # Merge gateway results into reviewer patches
+        patches = list(reviewer_result.patches)
+        chat_parts = [reviewer_result.chat_response] if reviewer_result.chat_response else []
+
+        if gateway_issues:
+            # Append gateway blocking issues to the existing blocking_issues patch
+            for p in patches:
+                if p.get("path") == "/blocking_issues":
+                    existing = p.get("value", [])
+                    p["value"] = existing + gateway_issues
+                    break
+
+            chat_parts.append(
+                f"[gateway] 추가 blocking issues: {len(gateway_issues)}건"
+            )
+
+        if gateway_warnings:
+            for p in patches:
+                if p.get("path") == "/warnings":
+                    existing = p.get("value", [])
+                    p["value"] = existing + gateway_warnings
+                    break
+
+            chat_parts.append(
+                f"[gateway] 추가 warnings: {len(gateway_warnings)}건"
+            )
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    async def _handle_export_request(
+        self,
+        doc_id: str,
+        doc_state: DocumentState,
+    ) -> AgentResult:
+        """Handle export request: Formatter Agent → Gateway export_docx → S3 link.
+
+        Requirements: 13.3, 13.4
+        """
+        export_task = Task(agent="formatter_agent", action="export", params={})
+        return await self.delegate_task("formatter_agent", export_task, doc_state)
+
+    # ------------------------------------------------------------------
+    # User edit → cost recalculation (Task 10.3 — Req 7.3, 8.3, 12.2, 12.3)
+    # ------------------------------------------------------------------
+
+    async def _handle_user_edit(
+        self,
+        doc_id: str,
+        doc_state: DocumentState,
+        edit_payload: dict,
+    ) -> AgentResult:
+        """Handle user edit on resources/staffing: mark as confirmed, recalculate costs.
+
+        v2: staffing data is in resources_cost_estimates (not staffing_plan).
+
+        Steps:
+          1. Apply user edits to resources_cost_estimates fields
+          2. Trigger Cost Agent recalculation
+          3. Update total_cost in resources_cost_estimates
+
+        Requirements: 7.3, 8.3, 12.2, 12.3
+        """
+        patches: list[dict] = []
+        chat_parts: list[str] = []
+
+        field_name = edit_payload.get("field", "")
+        new_value = edit_payload.get("value")
+
+        if field_name and new_value is not None:
+            # v2: edits target /sections/resources_cost_estimates/...
+            base_path = f"/sections/resources_cost_estimates/{field_name}"
+            patches.append({
+                "op": "replace",
+                "path": base_path,
+                "value": new_value,
+                "source": "user_input",
+            })
+
+            chat_parts.append(
+                f"[user_edit] resources_cost_estimates.{field_name} = {new_value}"
+            )
+
+        # Recalculate costs using the updated resources_cost_estimates
+        resources_dict = doc_state.sections.resources_cost_estimates.model_dump(mode="json")
+        calc = recalculate_costs(resources_dict)
+
+        # Update total_cost in resources_cost_estimates
+        if "total_cost" in calc:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/total_cost",
+                "value": calc["total_cost"],
+                "source": "calculated",
+            })
+
+        # Update total_hours in resources_cost_estimates
+        if "total_hours" in calc:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/total_hours",
+                "value": calc["total_hours"],
+                "source": "calculated",
+            })
+
+        grand_total = calc.get("grand_total_cost", 0)
+        chat_parts.append(
+            f"[cost_recalc] 비용 재계산 완료 — 총 ${grand_total:,.2f}"
+        )
+
+        return AgentResult(
+            success=True,
+            patches=patches,
+            chat_response="\n".join(chat_parts),
+        )
+
+    # ------------------------------------------------------------------
+    # Intent-based routing helpers for handle_message integration
+    # ------------------------------------------------------------------
+
+    def _detect_staffing_or_scope_change(self, tasks: list[Task]) -> bool:
+        """Check if any task modifies resources_cost_estimates or scope_of_work."""
+        for task in tasks:
+            if task.agent in ("staffing_agent", "cost_agent"):
+                return True
+            if task.action in ("recommend", "calculate"):
+                return True
+            if task.action == "calculate_resource_plan" and task.params.get("apply"):
+                return True
+        return False
+
+    def _detect_review_intent(self, user_message: str) -> bool:
+        """Check if user message requests a review."""
+        msg_lower = user_message.lower()
+        return any(kw in msg_lower for kw in ["리뷰", "review", "검증", "검사"])
+
+    def _detect_export_intent(self, user_message: str) -> bool:
+        """Check if user message requests an export."""
+        msg_lower = user_message.lower()
+        return any(kw in msg_lower for kw in ["export", "docx", "다운로드", "내보내기"])
+
+    def _detect_user_edit_intent(self, user_message: str) -> bool:
+        """Check if user message is a staffing plan edit."""
+        msg_lower = user_message.lower()
+        return any(kw in msg_lower for kw in [
+            "수정", "변경", "edit", "modify", "update",
+            "인원", "단가", "시간", "rate", "hours", "count",
+        ])
+
+    # ------------------------------------------------------------------
+    # Patch application with optimistic locking
+    # ------------------------------------------------------------------
+
+    async def apply_patches(
+        self,
+        doc_id: str,
+        patches: list[Patch],
+        expected_version: int,
+    ) -> int:
+        """Apply patches to DynamoDB with optimistic locking, then publish.
+
+        1. Fetch current document state
+        2. Apply patch operations to the in-memory state
+        3. Write back with ConditionExpression on version (optimistic lock)
+        4. Publish patches to AppSync Events
+
+        Returns the new document version after successful update.
+
+        Raises:
+            VersionConflictError: if the expected version doesn't match.
+        """
+        doc_state = self.document_store.get(doc_id)
+
+        # Apply all patch operations to the document state dict
+        doc_dict = doc_state.model_dump(mode="json")
+        for patch in patches:
+            for op in patch.operations:
+                _apply_operation(doc_dict, op)
+
+        # Reconstruct and persist with optimistic lock
+        updated_state = DocumentState.model_validate(doc_dict)
+        saved = self.document_store.update(updated_state, expected_version)
+        new_version = saved.version
+
+        # Update patch versions and publish to AppSync
+        for patch in patches:
+            patch.version = new_version
+            patch.version_before = expected_version
+            patch.version_after = new_version
+        await self.publish_patch(doc_id, patches)
+
+        return new_version
+
+    # ------------------------------------------------------------------
+    # AppSync Events publishing
+    # ------------------------------------------------------------------
+
+    async def publish_patch(self, doc_id: str, patches: list[Patch]) -> None:
+        """Publish patches to AppSync Events ``docs/{docId}/patch`` channel.
+
+        Uses AppSync Events HTTP API when configured, otherwise logs
+        for development visibility.
+        """
+        channel = f"docs/{doc_id}/patch"
+
+        for patch in patches:
+            payload = {
+                **patch.model_dump(mode="json"),
+                "type": "patch",
+            }
+            self._patch_log.append(patch)
+
+            if APPSYNC_HTTP_ENDPOINT:
+                await self._appsync_publish(channel, payload)
+            else:
+                logger.info(
+                    "publish_patch [dev] channel=%s patch_id=%s ops=%d",
+                    channel,
+                    patch.patch_id,
+                    len(patch.operations),
+                )
+
+    async def publish_status(self, doc_id: str, status: AgentStatus) -> None:
+        """Publish agent status to AppSync Events ``docs/{docId}/status`` channel."""
+        channel = f"docs/{doc_id}/status"
+        payload = {"doc_id": doc_id, "status": status.value}
+
+        self._status_log.append(payload)
+
+        if APPSYNC_HTTP_ENDPOINT:
+            await self._appsync_publish(channel, payload)
+        else:
+            logger.info(
+                "publish_status [dev] channel=%s status=%s",
+                channel,
+                status.value,
+            )
+
+    async def publish_chat(self, doc_id: str, message: str) -> None:
+        """Publish chat response to AppSync Events ``docs/{docId}/chat`` channel."""
+        channel = f"docs/{doc_id}/chat"
+        payload = {"doc_id": doc_id, "message": message}
+
+        if APPSYNC_HTTP_ENDPOINT:
+            await self._appsync_publish(channel, payload)
+        else:
+            logger.info("publish_chat [dev] channel=%s len=%d", channel, len(message))
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _transition(self, new_state: OrchestratorState) -> None:
+        """Transition the orchestrator state machine."""
+        logger.debug("state transition: %s → %s", self.state.value, new_state.value)
+        self.state = new_state
+
+    async def _retrieve_memory_context(
+        self, doc_id: str, user_message: str
+    ) -> list[dict]:
+        """Retrieve long-term context from AgentCore Memory.
+
+        Falls back to empty list if Memory is unavailable (degraded mode).
+        When the Memory API call fails, a warning/degraded status is
+        published to ``docs/{docId}/status`` (Req 2.5).
+        """
+        if self.memory is None:
+            return []
+
+        result = self.memory.retrieve_customer_context(
+            customer=doc_id, query=user_message
+        )
+
+        # retrieve_customer_context returns [] on failure via _safe_call;
+        # check the degraded flag set by the on_degraded callback.
+        if self._memory_degraded:
+            await self._publish_memory_degraded_status(
+                doc_id, "retrieve_customer_context"
+            )
+        return result
+
+    async def _fetch_document_state(
+        self, doc_id: str
+    ) -> tuple[DocumentState, int]:
+        """Fetch Document_State + version from DynamoDB.
+
+        Creates a new empty document if not found.
+        """
+        try:
+            doc = self.document_store.get(doc_id)
+            return doc, doc.version
+        except DocumentNotFoundError:
+            doc = DocumentState(document_id=doc_id, version=0)
+            self.document_store.put(doc)
+            return doc, 0
+
+    def _fetch_raw_document(self, doc_id: str, doc_state: DocumentState) -> dict:
+        """Fetch raw document data so permissions/change_requests survive schema validation."""
+        get_raw = getattr(self.document_store, "get_raw", None)
+        if callable(get_raw):
+            try:
+                return get_raw(doc_id)
+            except DocumentNotFoundError:
+                pass
+        return doc_state.model_dump(mode="json")
+
+    def _resolve_permission(self, item: dict, user_id: str) -> str:
+        """Resolve Runtime placeholder permissions.
+
+        Owner is treated as master. If a document has no owner yet, Runtime can
+        operate as master so first-write flows and local tests keep working.
+        """
+        owner = item.get("user_id") or item.get("owner_id") or ""
+        if (owner and user_id and owner == user_id) or (not owner):
+            return "master"
+
+        for key in ("document_permissions", "permissions"):
+            permissions = item.get(key)
+            if isinstance(permissions, dict):
+                role = _permission_value(permissions.get(user_id))
+                if role:
+                    return role
+        if user_id in (item.get("masters") or []):
+            return "master"
+        if user_id in (item.get("editors") or []):
+            return "edit"
+        if user_id in (item.get("suggesters") or []):
+            return "suggest"
+        if user_id in (item.get("readers") or []):
+            return "read"
+        return "read"
+
+    def _can_apply_direct(self, item: dict, permission: str) -> bool:
+        if permission == "master":
+            return True
+        if permission == "edit" and not _document_requires_review(item):
+            return True
+        return False
+
+    @staticmethod
+    def _can_create_change_request(permission: str) -> bool:
+        return permission in {"suggest", "edit", "master"}
+
+    def _create_change_request_record(
+        self,
+        *,
+        doc_id: str,
+        requester: str,
+        patches: list[Patch],
+    ) -> dict:
+        operations = [
+            op.model_dump(mode="json")
+            for patch in patches
+            for op in patch.operations
+        ]
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "change_request_id": f"cr-{uuid.uuid4().hex[:12]}",
+            "document_id": doc_id,
+            "requester": requester,
+            "status": "pending",
+            "summary": f"{len(operations)} proposed document change(s)",
+            "changes": [
+                {
+                    "section": _patch_section(op.get("path", "")),
+                    "as_is": None,
+                    "to_be": op.get("value"),
+                    "reason": op.get("reason", ""),
+                    "json_patch": [op],
+                }
+                for op in operations
+            ],
+            "json_patch": operations,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _save_runtime_change_request(
+        self,
+        raw_document: dict,
+        expected_version: int,
+        change_request: dict,
+    ) -> dict:
+        updated = deepcopy(raw_document)
+        requests = updated.get("change_requests")
+        if not isinstance(requests, list):
+            requests = []
+        requests.append(change_request)
+        updated["change_requests"] = requests
+
+        update_raw = getattr(self.document_store, "update_raw", None)
+        if not callable(update_raw):
+            raise RuntimeError("document store does not support raw change requests")
+        return update_raw(updated, expected_version)
+
+    async def _store_session_event(
+        self, doc_id: str, user_message: str, agent_response: str
+    ) -> None:
+        """Store session events in AgentCore Memory.
+
+        Silently degrades if Memory is unavailable and publishes a
+        warning/degraded status to ``docs/{docId}/status`` (Req 2.5).
+        """
+        if self.memory is None:
+            return
+
+        success = self.memory.store_session_event(
+            session_id=doc_id,
+            actor_id="parent_orchestrator",
+            content=f"user: {user_message}\nagent: {agent_response}",
+        )
+        if not success:
+            await self._publish_memory_degraded_status(
+                doc_id, "store_session_event"
+            )
+
+    # ------------------------------------------------------------------
+    # Memory context supplementation (Req 2.3, 11.3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _supplement_history_with_memory(
+        history: list[dict],
+        memory_context: list[dict],
+    ) -> list[dict]:
+        """Prepend long-term memory context to bounded history.
+
+        Inserts a system-level context message at the beginning of the
+        history so the LLM can leverage customer-specific facts
+        retrieved from AgentCore Memory without requiring the full
+        historical transcript.
+        """
+        context_texts = []
+        for record in memory_context:
+            content = record.get("content", {})
+            text = content.get("text", "") if isinstance(content, dict) else str(content)
+            if text:
+                context_texts.append(text)
+
+        if not context_texts:
+            return history
+
+        context_message = {
+            "role": "system",
+            "content": (
+                "[장기 메모리 컨텍스트]\n"
+                + "\n".join(f"- {t}" for t in context_texts)
+            ),
+        }
+        return [context_message] + list(history)
+
+    # ------------------------------------------------------------------
+    # Long-term fact detection and storage (Req 2.2)
+    # ------------------------------------------------------------------
+
+    # Keywords that indicate long-term customer characteristics
+    _LONG_TERM_KEYWORDS: list[tuple[str, str]] = [
+        ("보안", "security_requirement"),
+        ("security", "security_requirement"),
+        ("compliance", "compliance_requirement"),
+        ("컴플라이언스", "compliance_requirement"),
+        ("hipaa", "compliance_requirement"),
+        ("pci", "compliance_requirement"),
+        ("리전", "region_constraint"),
+        ("region", "region_constraint"),
+        ("ap-northeast", "region_constraint"),
+        ("us-east", "region_constraint"),
+        ("eu-west", "region_constraint"),
+        ("산업", "industry"),
+        ("industry", "industry"),
+        ("금융", "industry"),
+        ("헬스케어", "industry"),
+        ("healthcare", "industry"),
+    ]
+
+    def _extract_long_term_facts(self, user_message: str) -> list[dict]:
+        """Detect long-term customer facts from user message.
+
+        Scans for keywords indicating security requirements, region
+        constraints, compliance needs, or industry characteristics.
+        Returns a list of ``{"value": ..., "category": ...}`` dicts.
+        """
+        msg_lower = user_message.lower()
+        detected: list[dict] = []
+        seen_categories: set[str] = set()
+
+        for keyword, category in self._LONG_TERM_KEYWORDS:
+            if keyword in msg_lower and category not in seen_categories:
+                seen_categories.add(category)
+                detected.append({
+                    "value": f"[{category}] {user_message}",
+                    "category": category,
+                })
+
+        return detected
+
+    async def _detect_and_store_long_term_facts(
+        self,
+        doc_id: str,
+        user_message: str,
+        doc_state: DocumentState,
+    ) -> None:
+        """Detect long-term facts in user message and store them.
+
+        Extracts customer characteristics (security requirements,
+        region constraints, etc.) and persists them via
+        ``store_long_term_facts()`` for future session retrieval.
+
+        Falls back silently if Memory is unavailable (Req 2.5).
+        """
+        if self.memory is None:
+            return
+
+        facts = self._extract_long_term_facts(user_message)
+        if not facts:
+            return
+
+        # Determine customer scope from doc_state or doc_id
+        customer = doc_id
+        meta = getattr(doc_state, "meta", None)
+        if meta and isinstance(meta, dict):
+            customer_field = meta.get("customer", {})
+            if isinstance(customer_field, dict):
+                customer = customer_field.get("user_input") or doc_id
+            elif hasattr(customer_field, "user_input") and customer_field.user_input:
+                customer = customer_field.user_input
+
+        success = self.memory.store_long_term_facts(
+            customer=customer,
+            facts=facts,
+        )
+        if not success:
+            await self._publish_memory_degraded_status(
+                doc_id, "store_long_term_facts"
+            )
+
+    async def _publish_degraded_status(
+        self,
+        doc_id: str,
+        exc: InferenceProfileUnavailableError | None = None,
+    ) -> None:
+        """Publish degraded status to ``docs/{docId}/status`` channel.
+
+        Called when an inference profile is unavailable and the system
+        enters degraded mode (Req 1.7).
+        """
+        channel = f"docs/{doc_id}/status"
+        payload: dict[str, Any] = {
+            "doc_id": doc_id,
+            "status": AgentStatus.degraded.value,
+            "message": (
+                "AI 모델 inference profile이 일시적으로 사용 불가합니다. "
+                "일부 기능이 제한될 수 있습니다."
+            ),
+        }
+        if exc is not None:
+            payload["primary"] = exc.primary
+            payload["fallback"] = exc.fallback
+
+        self._status_log.append(payload)
+
+        if APPSYNC_HTTP_ENDPOINT:
+            await self._appsync_publish(channel, payload)
+        else:
+            logger.info(
+                "publish_status [dev] channel=%s status=degraded",
+                channel,
+            )
+
+    async def _publish_memory_degraded_status(
+        self,
+        doc_id: str,
+        method_name: str,
+    ) -> None:
+        """Publish warning/degraded status when Memory API fails (Req 2.5).
+
+        Informs the user that the system is operating in no-memory
+        degraded mode using bounded session history only.
+        """
+        channel = f"docs/{doc_id}/status"
+        payload: dict[str, Any] = {
+            "doc_id": doc_id,
+            "status": AgentStatus.degraded.value,
+            "reason": "memory_api_failure",
+            "failed_method": method_name,
+            "message": (
+                "Memory API가 일시적으로 사용 불가합니다. "
+                "현재 세션 이력만으로 동작합니다."
+            ),
+        }
+
+        self._status_log.append(payload)
+
+        if APPSYNC_HTTP_ENDPOINT:
+            await self._appsync_publish(channel, payload)
+        else:
+            logger.info(
+                "publish_status [dev] channel=%s status=degraded reason=memory_api_failure method=%s",
+                channel,
+                method_name,
+            )
+
+    def _on_memory_degraded(self, method_name: str, exc: Exception) -> None:
+        """Callback passed to AgentCoreMemory.on_degraded.
+
+        Sets the ``_memory_degraded`` flag so the orchestrator can
+        publish a warning status after the call returns.
+        """
+        self._memory_degraded = True
+        logger.warning(
+            "Memory degraded callback: method=%s error=%s", method_name, exc
+        )
+
+    async def _appsync_publish(self, channel: str, payload: dict) -> None:
+        """Publish a message to an AppSync Events channel via HTTP POST.
+
+        Uses the AppSync Events HTTP API with API key authentication.
+        """
+        try:
+            import urllib.request
+            import urllib.error
+
+            url = f"{APPSYNC_HTTP_ENDPOINT}/event"
+            data = json.dumps({
+                "channel": channel,
+                "events": [json.dumps(payload)],
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": APPSYNC_API_KEY,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.debug(
+                    "AppSync publish OK channel=%s status=%d",
+                    channel,
+                    resp.status,
+                )
+        except Exception as exc:
+            logger.error(
+                "AppSync publish failed channel=%s: %s", channel, exc
+            )
+
+
+# ---------------------------------------------------------------------------
+# Patch operation helpers
+# ---------------------------------------------------------------------------
+
+def _ai_field_value(value: Any) -> dict[str, Any]:
+    return {
+        "user_input": None,
+        "ai_recommended": value or "",
+        "calculated": None,
+        "status": FieldStatus.draft.value,
+        "user_edited": False,
+    }
+
+
+def _contact_to_field_value(c: dict) -> dict:
+    """Convert a contact dict to v2 FieldValue structure.
+    v2: no role_or_description — uses description, stakeholder_for, role separately.
+    """
+    def fv(value):
+        return _ai_field_value(value)
+
+    return {
+        "name": fv(c.get("name", "")),
+        "title": fv(c.get("title", "")),
+        "description": fv(c.get("description", "")),
+        "stakeholder_for": fv(c.get("stakeholder_for", "")),
+        "role": fv(c.get("role", "")),
+        "contact": fv(c.get("contact", "")),
+    }
+
+
+def _field_value_list(items: list[Any]) -> list[dict[str, Any]]:
+    return [_ai_field_value(item) for item in items]
+
+
+def _category_group_to_field_values(group: dict[str, Any]) -> dict[str, Any]:
+    """v2: uses bullets (not items)."""
+    return {
+        "category_name": _ai_field_value(group.get("category_name", "")),
+        "bullets": _field_value_list(group.get("bullets", group.get("items", []))),
+    }
+
+
+def _scope_task_to_field_values(task: dict[str, Any]) -> dict[str, Any]:
+    """v2: details is a single FieldValue (not list[FieldValue])."""
+    details_raw = task.get("details", "")
+    if isinstance(details_raw, list):
+        details_raw = "\n".join(str(d) for d in details_raw if d)
+    return {
+        "task_category": _ai_field_value(task.get("task_category", "")),
+        "schedule": _ai_field_value(task.get("schedule", "")),
+        "details": _ai_field_value(details_raw),
+        "personnel": _ai_field_value(task.get("personnel", "")),
+    }
+
+
+def _architecture_service_to_field_values(service: Any) -> dict[str, Any]:
+    if not isinstance(service, dict):
+        service = {"service_name": str(service), "service_id": str(service)}
+    return {
+        "service_name": _ai_field_value(service.get("service_name", "")),
+        "service_id": service.get("service_id", ""),
+        "priority": service.get("priority", 99),
+        "category": service.get("category", "compute"),
+        "description": _ai_field_value(service.get("description", "")),
+        "sizing_rationale": _ai_field_value(service.get("sizing_rationale", "")),
+        "is_required_for_funding": bool(service.get("is_required_for_funding", False)),
+    }
+
+
+def _discovery_schema_patches(discovery_result: Any) -> list[dict]:
+    """Build v2 schema patches from discovery result.
+    v2: no /sections/executive_summary/text, no /sections/acceptance/text.
+    """
+    patches: list[dict] = []
+    structured_input = getattr(discovery_result, "structured_input", {}) or {}
+    summary_fields = getattr(discovery_result, "executive_summary_fields", {}) or {}
+    business_case = getattr(discovery_result, "business_case", {}) or {}
+
+    # v2 executive summary fields (no legacy text/summary paths)
+    for path, value in [
+        ("/sections/executive_summary/customer_intro", summary_fields.get("customer_intro", "")),
+        ("/sections/executive_summary/problem_statement", summary_fields.get("problem_statement", "")),
+        ("/sections/executive_summary/proposed_solution", summary_fields.get("proposed_solution", "")),
+        ("/sections/executive_summary/business_case/problem_definition", business_case.get("problem_definition", "")),
+        ("/sections/executive_summary/business_case/roi_calculation", business_case.get("roi_calculation", "")),
+        ("/sections/executive_summary/business_case/executive_sponsor", business_case.get("executive_sponsor", "")),
+        ("/sections/executive_summary/business_case/production_commitment", business_case.get("production_commitment", "")),
+    ]:
+        if value != "":
+            patches.append({
+                "op": "replace",
+                "path": path,
+                "value": _ai_field_value(value),
+                "source": "ai_recommended",
+            })
+    phases_overview = summary_fields.get("phases_overview", [])
+    if phases_overview:
+        patches.append({
+            "op": "replace",
+            "path": "/sections/executive_summary/phases_overview",
+            "value": _field_value_list(phases_overview),
+            "source": "ai_recommended",
+        })
+
+    for path, contacts in [
+        ("/sections/stakeholders/executive_sponsors", discovery_result.executive_sponsors),
+        ("/sections/stakeholders/stakeholders", discovery_result.stakeholders),
+        ("/sections/stakeholders/project_team", discovery_result.project_team),
+        ("/sections/stakeholders/escalation_contacts", discovery_result.escalation_contacts),
+    ]:
+        field_name = path.rsplit("/", 1)[-1]
+        if not isinstance(structured_input.get(field_name), list) or not contacts:
+            continue
+        patches.append({
+            "op": "replace",
+            "path": path,
+            "value": [_contact_to_field_value(c) for c in contacts],
+            "source": "ai_recommended",
+        })
+
+    for path, items in [
+        ("/sections/success_criteria/items", discovery_result.success_criteria),
+        ("/sections/assumptions/items", discovery_result.assumptions),
+        ("/sections/scope_of_work/items", discovery_result.scope_of_work),
+    ]:
+        field_name = path.split("/")[-2]
+        if not isinstance(structured_input.get(field_name), list) or not items:
+            continue
+        patches.append({
+            "op": "replace",
+            "path": path,
+            "value": _field_value_list(items),
+            "source": "ai_recommended",
+        })
+    for path, groups in [
+        ("/sections/success_criteria/groups", getattr(discovery_result, "success_criteria_groups", [])),
+        ("/sections/assumptions/groups", getattr(discovery_result, "assumption_groups", [])),
+    ]:
+        if groups:
+            patches.append({
+                "op": "replace",
+                "path": path,
+                "value": [_category_group_to_field_values(group) for group in groups],
+                "source": "ai_recommended",
+            })
+    scope_tasks = getattr(discovery_result, "scope_tasks", [])
+    if scope_tasks:
+        patches.append({
+            "op": "replace",
+            "path": "/sections/scope_of_work/tasks",
+            "value": [_scope_task_to_field_values(task) for task in scope_tasks],
+            "source": "ai_recommended",
+        })
+
+    # Milestones: list[{phase, completion_date, deliverables[]}] → Phase schema
+    milestones = getattr(discovery_result, "milestones", []) or []
+    if milestones:
+        patches.append({
+            "op": "replace",
+            "path": "/sections/milestones/phases",
+            "value": [_milestone_phase_to_field_values(m) for m in milestones],
+            "source": "ai_recommended",
+        })
+
+    # Acceptance steps: list[{heading, content, bullets[]}] → AcceptanceStep schema
+    acceptance_steps = getattr(discovery_result, "acceptance_steps", []) or []
+    if acceptance_steps:
+        patches.append({
+            "op": "replace",
+            "path": "/sections/acceptance/steps",
+            "value": [_acceptance_step_to_field_values(s) for s in acceptance_steps],
+            "source": "ai_recommended",
+        })
+
+    # Cost info: stash totals as MRR/ARR placeholders + notes
+    cost_info = getattr(discovery_result, "cost_info", {}) or {}
+    if isinstance(cost_info, dict) and any(cost_info.values()):
+        aws_total = cost_info.get("aws_usage_total") or ""
+        total_amount = cost_info.get("total_amount") or ""
+        notes = cost_info.get("notes") or ""
+        if aws_total:
+            # AWS usage is typically quoted as a total for the PoC duration; surface
+            # it as MRR-equivalent for now and note the context.
+            patches.append({
+                "op": "replace",
+                "path": "/sections/cost_breakdown/mrr",
+                "value": _ai_field_value(str(aws_total)),
+                "source": "ai_recommended",
+            })
+        if total_amount:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/cost_breakdown/bedrock_extra",
+                "value": _ai_field_value(
+                    f"PoC 총액: {total_amount}" + (f" ({notes})" if notes else "")
+                ),
+                "source": "ai_recommended",
+            })
+        # Also mirror total_amount into resources_cost_estimates.total_cost.total
+        if total_amount:
+            patches.append({
+                "op": "replace",
+                "path": "/sections/resources_cost_estimates/total_cost/total",
+                "value": str(total_amount),
+                "source": "ai_recommended",
+            })
+    return patches
+
+
+def _acceptance_step_to_field_values(step: dict[str, Any]) -> dict[str, Any]:
+    bullets = step.get("bullets", [])
+    if not isinstance(bullets, list):
+        bullets = [bullets] if bullets else []
+    return {
+        "heading": _ai_field_value(step.get("heading", "")),
+        "content": _ai_field_value(step.get("content", "")),
+        "bullets": [
+            {"text": _ai_field_value(item), "level": 1}
+            for item in bullets
+            if item
+        ],
+    }
+
+
+def _milestone_phase_to_field_values(phase: dict[str, Any]) -> dict[str, Any]:
+    deliverables = phase.get("deliverables", "")
+    if not isinstance(deliverables, list):
+        deliverables = [deliverables] if deliverables else []
+    completion_date = phase.get("completion_date") or phase.get("date") or phase.get("end_date") or ""
+    return {
+        "phase": _ai_field_value(phase.get("phase", "")),
+        "completion_date": _ai_field_value(completion_date),
+        "deliverables": [
+            {"text": _ai_field_value(item), "level": 1}
+            for item in deliverables
+            if item
+        ],
+    }
+
+
+def _current_staffing_total(doc_state: DocumentState) -> float:
+    """v2: read from resources_cost_estimates.total_cost.total (str)."""
+    total_str = doc_state.sections.resources_cost_estimates.total_cost.total
+    if total_str:
+        try:
+            # Strip currency symbols and commas
+            cleaned = str(total_str).replace("$", "").replace(",", "").strip()
+            return float(cleaned)
+        except (ValueError, TypeError):
+            pass
+    return 0.0
+
+
+def _current_aws_monthly_total(doc_state: DocumentState) -> float:
+    """v2: read from cost_breakdown.mrr (FieldValue)."""
+    mrr_field = doc_state.sections.cost_breakdown.mrr
+    value = mrr_field.resolve()
+    if value:
+        try:
+            cleaned = str(value).replace("$", "").replace(",", "").strip()
+            return float(cleaned)
+        except (ValueError, TypeError):
+            pass
+    return 0.0
+
+
+PERMISSION_ORDER = {"read": 0, "suggest": 1, "edit": 2, "master": 3}
+
+
+def _permission_value(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("role") or value.get("permission") or value.get("level")
+    role = str(value or "").strip().lower()
+    return role if role in PERMISSION_ORDER else ""
+
+
+def _document_requires_review(item: dict) -> bool:
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    permission_settings = item.get("permission_settings") if isinstance(item.get("permission_settings"), dict) else {}
+    return bool(
+        settings.get("require_review")
+        or settings.get("requires_review")
+        or item.get("review_required")
+        or permission_settings.get("require_review")
+    )
+
+
+def _patch_section(path: str) -> str:
+    parts = [part for part in str(path or "").strip("/").split("/") if part]
+    if len(parts) >= 2 and parts[0] == "sections":
+        return parts[1]
+    return parts[0] if parts else "document"
+
+
+def _changed_sections(patches: list[Patch]) -> list[str]:
+    sections = {
+        _patch_section(op.path)
+        for patch in patches
+        for op in patch.operations
+    }
+    return sorted(section for section in sections if section)
+
+
+def _field_value_resolve(value: Any) -> Any:
+    if isinstance(value, dict) and any(key in value for key in ("user_input", "ai_recommended", "calculated")):
+        for key in ("user_input", "ai_recommended", "calculated"):
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return candidate
+        return ""
+    return value
+
+
+def _field_value_number(value: Any) -> float:
+    resolved = _field_value_resolve(value)
+    if resolved in (None, ""):
+        return 0.0
+    try:
+        return float(str(resolved).replace("$", "").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_operation(doc_dict: dict, op: PatchOperation) -> None:
+    """Apply a single JSON-Patch-style operation to a document dict."""
+    parts = [p for p in op.path.strip("/").split("/") if p]
+    if not parts:
+        return
+
+    current = doc_dict
+    for part in parts[:-1]:
+        if isinstance(current, dict):
+            current = current.setdefault(part, {})
+        else:
+            return
+
+    target_key = parts[-1]
+
+    if op.op == "replace" or op.op == "add":
+        if isinstance(current, dict):
+            current[target_key] = op.value
+    elif op.op == "remove":
+        if isinstance(current, dict):
+            current.pop(target_key, None)
