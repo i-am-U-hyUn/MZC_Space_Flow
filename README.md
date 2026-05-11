@@ -4,6 +4,7 @@
 > AWS 파트너사 영업·기술 담당자의 PoA (Proof of Authority) 문서 작성 비효율을 제거하는 Bedrock AgentCore 기반 자율 에이전트.
 
 - 📸 [스크린샷]
+[요건 정의 및 서비스 기획안 시나리오 보기 (GitHub 뷰어) ↗](docs/Requirements_And_Service_Plan_Team37_S3.pdf)
 [요건 정의 및 서비스 기획안 시나리오_Team 37_S3.pdf](https://github.com/user-attachments/files/27578045/_Team.37_S3.pdf)
 - 👥 Team 37 / MegazoneCloud
 
@@ -37,7 +38,8 @@
 ## 🏗️ 기술 구성
 
 - 📄 [아키텍처 설계서] 
-[아키텍처 설계서_Team 37_S3.pdf](https://github.com/user-attachments/files/27578057/_Team.37_S3.pdf)
+[아키텍처 설계서 보기 (GitHub 뷰어) ↗](https://github.com/i-am-U-hyUn/MZC_Space_Flow/blob/main/docs/Architecture_Design_Team37_S3.pdf)
+[아키텍처 설계서 다운받기_Team 37_S3.pdf](https://github.com/user-attachments/files/27578057/_Team.37_S3.pdf)
 
 
 | Layer | 기술 |
